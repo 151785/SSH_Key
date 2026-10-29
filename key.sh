@@ -264,7 +264,7 @@ force_main_conf() {
             }
         }' "$f" > "$tmp" || { rm -f "$tmp"; die "处理失败: $f"; }
     _commit_tmp "$tmp" "$f"
-    warn "drop-in 被更高优先级配置覆盖，已改写主配置: ${key} ${val}"
+    warn "未能定位配置来源，已把 ${key} ${val} 写入主配置 Include 之前"
 }
 
 ensure_dropin() {
@@ -277,6 +277,82 @@ ensure_dropin() {
     # 刚建的空白文件不需要备份，回滚时直接删除
     BK_FILES+=("$DROPIN_FILE"); BK_BACKUPS+=("")
     info "创建 drop-in: $DROPIN_FILE"
+}
+
+# 在指定文件的 [from,to] 行范围内找第一处未注释的 key，遇到 Match 即止（Match 内不算全局值）
+# 输出: "行号<TAB>原行内容"
+_find_in_file() {
+    local f="$1" key="$2" from="${3:-1}" to="${4:-999999}"
+    [ -f "$f" ] || return 1
+    awk -v k="$key" -v a="$from" -v b="$to" '
+        NR < a || NR > b { next }
+        {
+            t = $0; sub(/^[[:space:]]+/, "", t)
+            if (tolower(t) ~ /^match[[:space:]]/) exit
+            if (t == "" || t ~ /^#/) next
+            split(t, p, /[[:space:]]+/)
+            if (tolower(p[1]) == tolower(k)) { printf "%d\t%s\n", NR, $0; exit }
+        }' "$f"
+}
+
+# 按 sshd 真实读取顺序定位"谁在决定这个选项"：
+#   主配置 Include 之前 → sshd_config.d/*.conf（字母序） → 主配置 Include 之后
+# 输出: "文件<TAB>行号<TAB>原行内容"
+find_winner() {
+    local key="$1" inc total f hit
+    inc="$(grep -niE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$SSHD_CONFIG" 2>/dev/null \
+           | head -n1 | cut -d: -f1)"
+    total="$(wc -l < "$SSHD_CONFIG" | tr -d ' ')"
+
+    if [ -n "$inc" ]; then
+        hit="$(_find_in_file "$SSHD_CONFIG" "$key" 1 "$((inc - 1))")"
+        [ -n "$hit" ] && { printf '%s\t%s\n' "$SSHD_CONFIG" "$hit"; return 0; }
+
+        if [ -n "$DROPIN_DIR" ] && [ -d "$DROPIN_DIR" ]; then
+            # glob 在 LC_ALL=C 下按字节序展开，正是 sshd 读取 *.conf 的顺序
+            for f in "$DROPIN_DIR"/*.conf; do
+                [ -f "$f" ] || continue
+                hit="$(_find_in_file "$f" "$key" 1 999999)"
+                [ -n "$hit" ] && { printf '%s\t%s\n' "$f" "$hit"; return 0; }
+            done
+        fi
+
+        hit="$(_find_in_file "$SSHD_CONFIG" "$key" "$((inc + 1))" "$total")"
+        [ -n "$hit" ] && { printf '%s\t%s\n' "$SSHD_CONFIG" "$hit"; return 0; }
+    else
+        hit="$(_find_in_file "$SSHD_CONFIG" "$key" 1 "$total")"
+        [ -n "$hit" ] && { printf '%s\t%s\n' "$SSHD_CONFIG" "$hit"; return 0; }
+    fi
+    return 1
+}
+
+# 找到真正的来源后，就地改那一行（比"再插一行然后祈祷顺序对"可靠）
+fix_winner() {
+    local key="$1" val="$2" winner wfile wline wbody
+    if ! winner="$(find_winner "$key")"; then
+        warn "未定位到 ${key} 的配置来源（可能来自 sshd 编译默认值）"
+        return 1
+    fi
+    wfile="$(printf '%s' "$winner" | cut -f1)"
+    wline="$(printf '%s' "$winner" | cut -f2)"
+    wbody="$(printf '%s' "$winner" | cut -f3- | sed 's/^[[:space:]]*//')"
+
+    info "${key} 的实际生效来源: $(basename "$wfile"):${wline} → ${wbody}"
+
+    if [ "$wfile" = "$DROPIN_FILE" ]; then
+        warn "来源是本脚本写入的 drop-in，却仍未生效，跳过就地修改"
+        return 1
+    fi
+    backup_once "$wfile"
+    as_root sed -i "${wline}s/.*/${key} ${val}/" "$wfile" || die "修改 $wfile 失败"
+    fix_selinux "$wfile"
+    info "已就地修正 $(basename "$wfile"):${wline} → ${key} ${val}"
+
+    case "$wfile" in
+        *cloud-init*|*cloud.cfg*)
+            warn "该文件由 cloud-init 托管，重启后可能被重写；若要永久生效，请在 /etc/cloud/cloud.cfg 设置 ssh_pwauth: false"
+            ;;
+    esac
 }
 
 apply_option() {
@@ -309,7 +385,7 @@ effective_value() {
         | awk -v k="$key" 'tolower($1)==tolower(k){print $2; exit}'
 }
 
-verify_effective() {   # $@ = "key=value" 列表
+verify_effective() {   # $@ = "key=value" 列表；只报告，不修改
     local pair key val cur rc=0
     for pair in "$@"; do
         key="${pair%%=*}"; val="${pair#*=}"
@@ -319,13 +395,40 @@ verify_effective() {   # $@ = "key=value" 列表
             continue
         fi
         if [ "$cur" != "$val" ]; then
-            err "生效值与预期不符: ${key} 实际=${cur} 期望=${val}"
+            warn "生效值与预期不符: ${key} 实际=${cur} 期望=${val}"
             rc=1
         else
             info "生效确认: ${key} = ${cur}"
         fi
     done
     return $rc
+}
+
+# 不生效时：定位真正的来源 → 就地改 → 再校验；仍不行才退化为写主配置
+resolve_mismatch() {   # $@ = "key=value" 列表
+    local pair key val cur fixed=0
+    for pair in "$@"; do
+        key="${pair%%=*}"; val="${pair#*=}"
+        cur="$(effective_value "$key")"
+        [ "$cur" = "$val" ] && continue
+        warn "${key} 未按预期生效（实际=${cur:-未知}），开始定位覆盖来源…"
+        fix_winner "$key" "$val" || force_main_conf "$key" "$val"
+        fixed=1
+    done
+    [ "$fixed" = "1" ] || return 0
+
+    validate_config || return 1
+
+    for pair in "$@"; do
+        key="${pair%%=*}"; val="${pair#*=}"
+        cur="$(effective_value "$key")"
+        if [ "$cur" != "$val" ]; then
+            err "${key} 仍未生效（实际=${cur:-未知}）"
+            return 1
+        fi
+        info "生效确认: ${key} = ${cur}"
+    done
+    return 0
 }
 
 #=============================================================
@@ -340,6 +443,11 @@ fetch_url() {
     else
         die "需要 curl 或 wget 之一"
     fi
+}
+
+# 日志里只显示 scheme://host，隐藏 path/query（可能含个人标识或 token）
+mask_url() {
+    printf '%s' "$1" | sed -E 's#^([a-z]+://[^/?]+).*#\1/***#'
 }
 
 # 过滤掉注释/空行/过时算法（OpenSSH 10 已移除 DSA，装进去只会白写一行）
@@ -367,7 +475,8 @@ collect_pubkey() {
         github)
             [ -n "$KEY_ID" ] || { read -r -e -p "请输入 GitHub 用户名: " KEY_ID; }
             [ -n "$KEY_ID" ] || die "输入为空"
-            info "GitHub 账号: ${KEY_ID}"
+            # 不回显账号：终端/日志可能被截图或共享
+            info "正在从 GitHub 获取公钥..."
             raw="$(fetch_url "https://github.com/${KEY_ID}.keys")"
             if [ -z "$raw" ] || [ "$(printf '%s' "$raw" | head -c 20)" = "Not Found" ]; then
                 die "该账号没有公开的 SSH 公钥（或账号不存在）"
@@ -376,7 +485,7 @@ collect_pubkey() {
         url)
             [ -n "$KEY_URL" ] || { read -r -e -p "请输入公钥 URL: " KEY_URL; }
             [ -n "$KEY_URL" ] || die "输入为空"
-            info "拉取: ${KEY_URL}"
+            info "拉取: $(mask_url "$KEY_URL")"
             raw="$(fetch_url "$KEY_URL")"
             [ -n "$raw" ] || die "拉取失败或内容为空"
             ;;
@@ -664,16 +773,30 @@ check_listen() {
 # 回滚（-r）
 #=============================================================
 do_rollback() {
-    local f newest n=0
-    for f in "$SSHD_CONFIG" "$DROPIN_FILE"; do
-        [ -n "$f" ] && [ -f "$f" ] || continue
-        newest="$(ls -1t "${f}".bak.* 2>/dev/null | head -n1)"
-        if [ -n "$newest" ]; then
-            as_root cp -a "$newest" "$f" || die "回滚失败: $f"
-            info "已从 $(basename "$newest") 恢复 $(basename "$f")"
+    local f newest n=0 base
+    local newest_main
+    # 1) 主配置
+    if [ -n "$SSHD_CONFIG" ] && [ -f "$SSHD_CONFIG" ]; then
+        newest_main="$(ls -1t "${SSHD_CONFIG}".bak.* 2>/dev/null | head -n1)"
+        if [ -n "$newest_main" ]; then
+            as_root cp -a "$newest_main" "$SSHD_CONFIG" || die "回滚失败: $SSHD_CONFIG"
+            info "已从 $(basename "$newest_main") 恢复 $(basename "$SSHD_CONFIG")"
             n=$((n + 1))
         fi
-    done
+    fi
+    # 2) drop-in 目录（含被就地修改的第三方 conf）
+    if [ -n "$DROPIN_DIR" ] && [ -d "$DROPIN_DIR" ]; then
+        for base in $(ls -1 "$DROPIN_DIR" 2>/dev/null \
+                      | sed -n 's/^\(.*\.conf\)\.bak\..*$/\1/p' | LC_ALL=C sort -u); do
+            f="${DROPIN_DIR}/${base}"
+            newest="$(ls -1t "${f}".bak.* 2>/dev/null | head -n1)"
+            if [ -n "$newest" ]; then
+                as_root cp -a "$newest" "$f" || die "回滚失败: $f"
+                info "已从 $(basename "$newest") 恢复 ${base}"
+                n=$((n + 1))
+            fi
+        done
+    fi
     [ "$n" -gt 0 ] || die "没有找到备份文件（*.bak.*）"
     validate_config || die "回滚后的配置仍有语法错误，请手动检查"
     NEED_RESTART=1
@@ -754,21 +877,11 @@ main() {
             die "配置校验未通过，已回滚，未重启服务"
         fi
 
-        # 生效校验：不通过则降级改主配置；再不通就回滚
+        # 生效校验：不生效就精确定位来源并就地修正，仍不行则回滚
         if ! verify_effective "${CHANGE_PAIRS[@]}"; then
-            if [ -n "$DROPIN_FILE" ]; then
-                local pair
-                for pair in "${CHANGE_PAIRS[@]}"; do
-                    force_main_conf "${pair%%=*}" "${pair#*=}"
-                done
-                validate_config || { rollback_all; die "配置校验未通过，已回滚"; }
-                if ! verify_effective "${CHANGE_PAIRS[@]}"; then
-                    rollback_all
-                    die "配置仍被更高优先级的配置覆盖（可能存在 /etc/ssh/sshd_config.d 之外的 Include 或 Match 规则），已回滚"
-                fi
-            else
+            if ! resolve_mismatch "${CHANGE_PAIRS[@]}"; then
                 rollback_all
-                die "配置未按预期生效，已回滚"
+                die "配置无法生效，已回滚。可手动排查：sshd -T | grep -iE '^(port|passwordauthentication) '"
             fi
         fi
 
